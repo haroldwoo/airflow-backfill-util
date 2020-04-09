@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# Modified from https://github.com/AnkurChoraywal/airflow-backfill-util.git
 
 # Inbuilt Imports
 import os
@@ -24,7 +25,10 @@ from shelljob import proc
 
 
 # Set your Airflow home path
-airflow_home_path = os.environ['AIRFLOW_HOME']
+if 'AIRFLOW_HOME' in os.environ:
+    airflow_home_path = os.environ['AIRFLOW_HOME']
+else:
+    airflow_home_path = '/tmp'
 
 # Local file where history will be stored
 FILE = airflow_home_path + '/logs/backfill_history.txt'
@@ -83,30 +87,60 @@ class Backfill(get_baseview()):
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
         clear = request.args.get("clear")
+        dry_run = request.args.get("dry_run")
+        task_regex = request.args.get("task_regex")
+        use_task_regex = request.args.get("use_task_regex")
+
+        # Construct the airflow command
+        cmd = ['airflow']
 
         if clear == 'true':
-            cmd = ['airflow', 'clear', '-c', str(dag_name), '-s', str(start_date), '-e', str(end_date)]
-        else:
-            cmd = ['airflow', 'backfill', str(dag_name), '-s', str(start_date), '-e', str(end_date), '-i']
+            cmd.append('clear')
+            if dry_run == 'true':
+                # For dryruns we simply timeout to avoid zombie procs waiting on user input. The output is what we're interested in
+                timeout_list = ['timeout', '60']
+                cmd = timeout_list + cmd
+            elif dry_run == 'false':
+                cmd.append('-c')
+
+            if use_task_regex == 'true':
+                cmd.extend(['-t', str(task_regex)])
+        elif clear == 'false':
+            cmd.append('backfill')
+            if dry_run == 'true':
+                cmd.append('--dry_run')
+
+            if use_task_regex == 'true':
+                cmd.extend(['-t', str(task_regex)])
+
+        cmd.extend(['-s', str(start_date), '-e', str(end_date), str(dag_name)])
 
         print('BACKFILL CMD:', cmd)
 
-        # Update command used in history
+        # updates command used in history
         file_ops('w', ' '.join(cmd))
 
         g = proc.Group()
         g.run(cmd)
 
+        # To print out cleared dry run task instances
+        pattern = '^\<.*\>$'
+
         def read_process():
             while g.is_pending():
                 lines = g.readlines()
                 for proc, line in lines:
-                    if not isinstance(line, str):
-                        line = line.decode()
-                    line = ansi_escape.sub('', line)
-                    print('LINE===> {}'.format(line))
+                    result = re.match(pattern, line)
 
-                    yield "data:" + line + "\n"
+                    if result:
+                        # Adhere to text/event-stream format
+                        line = line.replace('<','').replace('>','')
+                    elif clear == 'true' and dry_run == 'false':
+                        # Special case/hack, airflow clear -c no longer outputs a termination string, so we put one
+                        line = "Clear Done"
+
+                    yield "data:" + line + "\n\n"
+
 
         return flask.Response(read_process(), mimetype='text/event-stream')
 
@@ -118,15 +152,23 @@ class Backfill(get_baseview()):
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
         clear = request.args.get("clear")
+        task_regex = request.args.get("task_regex")
+        use_task_regex = request.args.get("use_task_regex")
 
         # create a screen id based on timestamp
         screen_id = datetime.datetime.now().strftime('%s')
 
+        # Prepare the command and execute in background
+        background_cmd = "screen -dmS {} ".format(screen_id)
         if clear == 'true':
-            # Prepare the command and execute in background
-            background_cmd = f"screen -dmS {screen_id} airflow clear -c {dag_name} -s {start_date} -e {end_date}"
-        else:
-            background_cmd = f"screen -dmS {screen_id} airflow backfill {dag_name} -s {start_date} -e {end_date} -i"
+            background_cmd = background_cmd + 'airflow clear -c '
+        elif clear == 'false':
+            background_cmd = background_cmd + 'airflow backfill '
+
+        if use_task_regex == 'true':
+            background_cmd = background_cmd + "-t {} ".format(task_regex)
+
+        background_cmd = background_cmd + "-s {} -e {} {}".format(start_date, end_date, dag_name)
 
         # Update command in file
         file_ops('w', background_cmd)
